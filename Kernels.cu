@@ -1,13 +1,15 @@
+// CUDA
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 
+// Helpers
+#include "helper_cuda.h"
+
+// Natives
 #include <cstdio>
 
 
-/**
- * Get rid of false error squiggly lines inside VS.
- * See: https://stackoverflow.com/a/27992604
- */
+//Work around false error squiggly lines inside VS; see: https://stackoverflow.com/a/27992604
 #ifdef __INTELLISENSE__
 #define KERNEL_2ARGS(grid, block)
 #define KERNEL_3ARGS(grid, block, sh_mem)
@@ -18,90 +20,198 @@
 #define KERNEL_4ARGS(grid, block, sh_mem, stream) <<< grid, block, sh_mem, stream >>>
 #endif
 
-
-__global__ void addKernel(int *c, const int *a, const int *b)
+__device__ uchar3 toColor(float2 texCoords, int imageW, int imageH)
 {
-    int i = threadIdx.x;
-    c[i] = a[i] + b[i];
+    if (texCoords.x > 0.f && texCoords.y > 0.f)
+    {
+        //printf("Tex2D valid lookup: %f %f\n", texCoords.x, texCoords.y);
+		return uchar3{
+			int(255.99f * texCoords.x / float(imageW)),
+			int(255.99f * texCoords.y / float(imageH)),
+			int(255.99f *                         .3f)
+		};
+    }
+    return uchar3{ 0,0,0, };
 }
 
-
-// Helper function for using CUDA to add vectors in parallel.
-cudaError_t addWithCuda(int *c, const int *a, const int *b, unsigned int size)
+__global__ void jumpFloodSync(uchar3* outputCanvas, float2* transientCanvas, int diagramXDim, int diagramYDim, cudaTextureObject_t texture)
 {
-    int *dev_a = 0;
-    int *dev_b = 0;
-    int *dev_c = 0;
-    cudaError_t cudaStatus;
+	// calculate non-normalized texture coordinates
+	unsigned x = blockIdx.x * blockDim.x + threadIdx.x;
+	unsigned y = blockIdx.y * blockDim.y + threadIdx.y;
 
-    // Choose which GPU to run on, change this on a multi-GPU system.
-    cudaStatus = cudaSetDevice(0);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
-        goto Error;
-    }
+	if (x > diagramXDim || y > diagramYDim) return;
 
-    // Allocate GPU buffers for three vectors (two input, one output).
-    cudaStatus = cudaMalloc((void**)&dev_c, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
+	unsigned outputIdx = y * diagramXDim + x;
+	float r, g;
+#ifndef __INTELLISENSE__
+	r = tex2D<float>(texture, 2 * x, y);
+	g = tex2D<float>(texture, 2 * x + 1, y);
+#endif
 
-    cudaStatus = cudaMalloc((void**)&dev_a, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
+	transientCanvas[outputIdx] = { r, g };
+	outputCanvas[outputIdx] = toColor({ r, g }, diagramXDim, diagramYDim);
+}
 
-    cudaStatus = cudaMalloc((void**)&dev_b, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
+__global__ void jumpFloodKernel(uchar3* outputCanvas, float2* transientCanvas, int diagramXDim, int diagramYDim, int passIndex, cudaTextureObject_t texture)
+{
+	// calculate non-normalized texture coordinates
+	unsigned x = blockIdx.x * blockDim.x + threadIdx.x;
+	unsigned y = blockIdx.y * blockDim.y + threadIdx.y;
 
-    // Copy input vectors from host memory to GPU buffers.
-    cudaStatus = cudaMemcpy(dev_a, a, size * sizeof(int), cudaMemcpyHostToDevice);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
+	// Ignore out-of-bounds
+	if (x > diagramXDim || y > diagramYDim) return;
 
-    cudaStatus = cudaMemcpy(dev_b, b, size * sizeof(int), cudaMemcpyHostToDevice);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
+	unsigned outputIdx = y * diagramXDim + x;
 
-    // Launch a kernel on the GPU with one thread for each element.
-    addKernel KERNEL_2ARGS(1, size) (dev_c, dev_a, dev_b);
+	// JFA step computations
+	float maximalDim = fmaxf(diagramXDim, diagramYDim);
+	int step = powf(2.f, (log2f(maximalDim) - passIndex - 1));
+	for (int gridY = 0; gridY < 3; ++gridY)
+	{
+		for (int gridX = 0; gridX < 3; ++gridX)
+		{
+			int xLookup = x - step + gridX * step;
+			int yLookup = y - step + gridY * step;
 
-    // Check for any errors launching the kernel
-    cudaStatus = cudaGetLastError();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
-        goto Error;
-    }
-    
-    // cudaDeviceSynchronize waits for the kernel to finish, and returns
-    // any errors encountered during the launch.
-    cudaStatus = cudaDeviceSynchronize();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching addKernel!\n", cudaStatus);
-        goto Error;
-    }
+			// Ignore out-of-bounds
+			if (xLookup < 0.f || xLookup > diagramXDim || yLookup < 0.f || yLookup > diagramYDim) continue;
 
-    // Copy output vector from GPU buffer to host memory.
-    cudaStatus = cudaMemcpy(c, dev_c, size * sizeof(int), cudaMemcpyDeviceToHost);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
+			float rTheirs, gTheirs;
+#ifndef __INTELLISENSE__
+			rTheirs = tex2D<float>(texture, 2 * xLookup, yLookup);
+			gTheirs = tex2D<float>(texture, 2 * xLookup + 1, yLookup);
+#endif
 
-Error:
-    cudaFree(dev_c);
-    cudaFree(dev_a);
-    cudaFree(dev_b);
-    
-    return cudaStatus;
+			// Ignore non-seed pixels
+			if (!(rTheirs + gTheirs > 0.f)) continue;
+
+			float rMe, gMe;
+#ifndef __INTELLISENSE__
+			rMe = tex2D<float>(texture, 2 * x, y);
+			gMe = tex2D<float>(texture, 2 * x + 1, y);
+#endif
+
+			// No closest seed yet, adopt it
+			if (!(rMe + gMe) > 0.f)
+			{
+				transientCanvas[outputIdx] = { rTheirs, gTheirs };
+				outputCanvas[outputIdx] = toColor({ rTheirs, gTheirs }, diagramXDim, diagramYDim);
+				continue;
+			}
+
+			// Calculate distance only if really needed
+			float curDistance = sqrtf((rMe - x) * (rMe - x) + (gMe - y) * (gMe - y));
+			float newDistance = sqrtf((rTheirs - x) * (rTheirs - x) + (gTheirs - y) * (gTheirs - y));
+			if (newDistance < curDistance)
+			{
+				transientCanvas[outputIdx] = { rTheirs, gTheirs };
+				outputCanvas[outputIdx] = toColor({ rTheirs, gTheirs }, diagramXDim, diagramYDim);
+			}
+		}
+	}
+#ifndef __INTELLISENSE__
+	__syncthreads();
+#endif
+}
+
+void jumpFloodWithCuda(unsigned char* hostResultCanvas, float2* hostSourceCanvas, int diagramXDim, int diagramYDim)
+{
+	// For sanity
+	checkCudaErrors(cudaSetDevice(0));
+
+	// Allocate output
+    int uintChannels = 3;
+	uchar3* deviceOutputCanvas;
+	size_t outputCanvasSize = diagramXDim * diagramYDim * uintChannels * sizeof(unsigned char);
+	checkCudaErrors(cudaMalloc((void**)&deviceOutputCanvas, outputCanvasSize));
+
+	// Allocate transient space
+    int floatChannels = 2;
+	float2* deviceTransientCanvas;
+	size_t transientCanvasSize = diagramXDim * diagramYDim * floatChannels * sizeof(float);
+	cudaMalloc((void**)&deviceTransientCanvas, transientCanvasSize);
+
+
+	// Allocate image space; see: https://stackoverflow.com/a/16217548
+	cudaArray* deviceInputCanvas;
+	cudaChannelFormatDesc channelDescription = cudaCreateChannelDesc<float>();
+	checkCudaErrors(cudaMallocArray(&deviceInputCanvas, &channelDescription, diagramXDim * floatChannels, diagramYDim));
+    checkCudaErrors(cudaMemcpy2DToArray(
+        deviceInputCanvas,                                              // Dest data cudaArray
+        0,
+        0,
+        hostSourceCanvas,                                               // Source data pointer
+        diagramXDim * floatChannels * sizeof(float),                    // Pitch/alignment for this allocated memory
+        diagramXDim * floatChannels * sizeof(float),                    // Copy span width (bytes)
+        diagramYDim,                                                    // Copy span height (elements)
+        cudaMemcpyHostToDevice
+    ));
+
+	// Texture resource
+	cudaResourceDesc textureResource;
+	memset(&textureResource, 0, sizeof(cudaResourceDesc));
+	textureResource.resType         = cudaResourceTypeArray;
+	textureResource.res.array.array = deviceInputCanvas;
+
+	// Texture description (actually important); see: https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#texture-object-api
+	cudaTextureDesc textureDescription;
+	memset(&textureDescription, 0, sizeof(cudaTextureDesc));
+	textureDescription.addressMode[0]   = cudaAddressModeClamp;         // Clamp over-index lookups across X (default)
+	textureDescription.addressMode[1]   = cudaAddressModeClamp;         // Clamp over-index lookups across Y (default)
+    textureDescription.filterMode       = cudaFilterModePoint;          // Do not interpolate, pick the actual closest value during lookup
+	textureDescription.readMode         = cudaReadModeElementType;      // Do not convert the returned lookup data
+	textureDescription.normalizedCoords = 0;                            // Use tex coords, not coords between [0,1)
+
+	// Texture object (allocated and bound during runtime, as opposed to the texture reference)
+	cudaTextureObject_t texture = 0;
+	checkCudaErrors(cudaCreateTextureObject(&texture, &textureResource, &textureDescription, NULL));
+
+	// Define kernel dimensions & sync
+	dim3 bDim(8, 8, 1);
+	dim3 gDim(diagramXDim / bDim.x, diagramYDim / bDim.y, 1);
+	jumpFloodSync KERNEL_2ARGS(gDim, bDim) (deviceOutputCanvas, deviceTransientCanvas, diagramXDim, diagramYDim, texture);
+	checkCudaErrors(cudaDeviceSynchronize());
+
+	float maximalDim = fmaxf(diagramXDim, diagramYDim);
+	// We perform log2(N) steps, N being the maximal dims of our image
+	for (int passIndex = 0; passIndex <= log2f(maximalDim); ++passIndex)
+	{
+		// Launch main computations kernel
+		jumpFloodKernel KERNEL_2ARGS(gDim, bDim)(deviceOutputCanvas, deviceTransientCanvas, diagramXDim, diagramYDim, passIndex, texture);
+		checkCudaErrors(cudaDeviceSynchronize());
+
+		// Update the texture
+		checkCudaErrors(cudaMemcpy2DToArray(
+			deviceInputCanvas,                                              // Dest data cudaArray
+			0,
+			0,
+			deviceTransientCanvas,                                          // Source data pointer
+			diagramXDim * floatChannels * sizeof(float),                    // Pitch/alignment for this allocated memory
+			diagramXDim * floatChannels * sizeof(float),                    // Copy span width (bytes)
+			diagramYDim,                                                    // Copy span height (elements)
+			cudaMemcpyDeviceToDevice
+		));
+	}
+
+	// Sanity checks
+	getLastCudaError("Kernel launch failed!");
+
+	// Copy back
+    checkCudaErrors(cudaMemcpy2D(
+        hostResultCanvas,                                               // Dest data pointer
+        diagramXDim * uintChannels * sizeof(unsigned char),             // Dest mem alignment
+        deviceOutputCanvas,                                             // Source data pointer
+        diagramXDim * uintChannels * sizeof(unsigned char),             // Source mem alignment
+        diagramXDim * uintChannels * sizeof(unsigned char),             // Copy span width (bytes)
+        diagramYDim,                                                    // Copy span height (elements)
+        cudaMemcpyDeviceToHost
+    ));
+
+	// Cleanup
+	checkCudaErrors(cudaFree(deviceOutputCanvas));
+	checkCudaErrors(cudaFree(deviceTransientCanvas));
+	checkCudaErrors(cudaFreeArray(deviceInputCanvas));
+	checkCudaErrors(cudaDestroyTextureObject(texture));
+	checkCudaErrors(cudaDeviceReset());
 }
