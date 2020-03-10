@@ -1,19 +1,16 @@
-
+// CUDA
 #include "cuda_runtime.h"
 #include "helper_string.h"
 #include "helper_image.h"
 
-#include "ft2build.h"
-#include FT_FREETYPE_H
-
+// Native
 #include <cstdio>
+#include <chrono>
+#include <random>
 #include <cmath>
 
 
-/**
- * Get rid of false error squiggly lines inside VS.
- * See: https://stackoverflow.com/a/27992604
- */
+// Work around false error squiggly lines inside VS; see: https://stackoverflow.com/a/27992604
 #ifdef __INTELLISENSE__
 #define KERNEL_2ARGS(gridSize, blockSize)
 #define KERNEL_3ARGS(gridSize, blockSize, sh_mem)
@@ -25,14 +22,112 @@
 #endif
 
 
+// Parameters
+#define NPOINTS 10
+
+
+// Forward declares
 void jumpFloodWithCuda(unsigned char* hostResultCanvas, float2* hostSourceCanvas, int diagramXDim, int diagramYDim);
 
+
+/**
+ * Generate a random uniform distribution of 2D floats.
+ */
+float2* randomUniformClamped2D(int nPoints)
+{
+	std::mt19937_64 goodRng;
+
+	// Time dependent seed, the "modern" way
+	uint64_t genSeed = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+	std::seed_seq sequence{ uint32_t(genSeed & 0xFFFFFFFF), uint32_t(genSeed >> 32) };
+	goodRng.seed(sequence);
+
+	// Initialize uniform distribution, clamped to [0,1)
+	std::uniform_real_distribution<float> unif(0, 1);
+
+	// Generate point "cloud"
+	float2* points = (float2*)malloc(nPoints * sizeof(float2));
+	for (int iSim = 0; iSim < nPoints; ++iSim)
+	{
+		points[iSim].x = unif(goodRng);
+		points[iSim].y = unif(goodRng);
+	}
+
+	return points;
+}
+
+
+/**
+ * Main program: generate a Voronoi fill using the Jump-Flood algorithm, computed on the GPU.
+ */
 int main()
 {
+	const int diagramXDim = 256;
+	const int diagramYDim = 256;
+	const int channels = 3;
+
+	/**
+	 * 1. Generate some seed pixel locations.
+	 */
+	float2* voronoiSeedsUV = randomUniformClamped2D(NPOINTS);
+	// Texture coordinates (sub-pixel measurement, similar to gl_TexCoord)
+	float2 voronoiSeeds[NPOINTS];
+	for (int iSeed = 0; iSeed < NPOINTS; ++iSeed)
+	{
+		voronoiSeeds[iSeed] = float2{
+			.49f + floor(voronoiSeedsUV[iSeed].x * float(diagramXDim)),
+			.49f + floor(voronoiSeedsUV[iSeed].y * float(diagramYDim))
+		};
+	}
+
+	/**
+	 * 2. Set the R,G values of the seed pixels to their own tex coordinates.
+	 */
+	float2 voronoiCanvas[diagramXDim * diagramYDim];
+	float2* voronoiCanvasFill = voronoiCanvas;
+	for (int iRow = 0; iRow < diagramYDim; iRow++)
+	{
+		for (int iCol = 0; iCol < diagramXDim; iCol++)
+		{
+			for (int iSeed = 0; iSeed < NPOINTS; ++iSeed)
+			{
+				if (iCol == int(voronoiSeeds[iSeed].x) && iRow == int(voronoiSeeds[iSeed].y))
+				{
+					printf("New seed at %f %f\n", voronoiSeeds[iSeed].x, voronoiSeeds[iSeed].y);
+					voronoiCanvasFill->x = voronoiSeeds[iSeed].x;
+					voronoiCanvasFill->y = voronoiSeeds[iSeed].y;
+					goto canvasIterationDone;
+				}
+			}
+
+			voronoiCanvasFill->x = 0.f;
+			voronoiCanvasFill->y = 0.f;
+
+		canvasIterationDone:
+			voronoiCanvasFill++;
+		}
+	}
+
+	/**
+	 * Allocate GPU resources and launch the main computation kernel.
+	 */
+	unsigned char* voronoiOutputImage = (unsigned char*)malloc(diagramXDim * diagramYDim * channels * sizeof(unsigned char));
+	jumpFloodWithCuda(voronoiOutputImage, voronoiCanvas, diagramXDim, diagramYDim);
+
+	char* diagramFileName = "./data/Diagram.ppm";
+	__savePPM(diagramFileName, voronoiOutputImage, diagramXDim, diagramYDim, 3);
+	printf("Wrote '%s'\n", diagramFileName);
+
+	/**
+	 * Cleanup.
+	 */
+	free(voronoiOutputImage);
+	free(voronoiSeedsUV);
+	return 0;
 
 #if 0
 	/**
-	 * Idea 1: 
+	 * Abandoned idea: 
 	 *	1. Read and rasterize a truetype font using the freetype lib
 	 *  2. Calculate the signed-distance-function (usually stored in the alpha channel for post processing) of a large resolution raster
 	 */
@@ -91,67 +186,4 @@ int main()
     }
 #endif
 
-	/**
-	 * Idea 2: generate a Voronoi fill using the Jump-Flood algorithm, computed on the GPU.
-	 */
-	const int seeds = 3;
-	const int diagramXDim = 128;
-	const int diagramYDim = 128;
-	const int channels = 3;
-
-	/**
-	 * 1. Set some hardcoded seed pixel locations.
-	 */
-	float2 voronoiSeedsUV[seeds] = {	// UV coordinates (between 0 and 1)
-		{.2f, .2f},				// p1: upper left
-		{.5f, .8f},				// p2: lower middle
-		{.8f, .2f},				// p3: upper right
-	};
-	float2 voronoiSeeds[seeds];			// Texture coordinates (sub-pixel measurement, similar to gl_TexCoord)
-	for (int iSeed = 0; iSeed < seeds; ++iSeed)
-	{
-		voronoiSeeds[iSeed] = float2{
-			.49f + floor(voronoiSeedsUV[iSeed].x * float(diagramXDim)),
-			.49f + floor(voronoiSeedsUV[iSeed].y * float(diagramYDim))
-		};
-	}
-
-	/**
-	 * 2. Set the R,G values of the seed pixels to their own tex coordinates.
-	 */
-	float2 voronoiCanvas[diagramXDim * diagramYDim];
-	float2* voronoiCanvasFill = voronoiCanvas;
-	for (int iRow = 0; iRow < diagramYDim; iRow++)
-	{
-		for (int iCol = 0; iCol < diagramXDim; iCol++)
-		{
-			for (int iSeed = 0; iSeed < seeds; ++iSeed)
-			{
-				if (iCol == int(voronoiSeeds[iSeed].x) && iRow == int(voronoiSeeds[iSeed].y))
-				{
-					printf("New seed at %f %f\n", voronoiSeeds[iSeed].x, voronoiSeeds[iSeed].y);
-					voronoiCanvasFill->x = voronoiSeeds[iSeed].x;
-					voronoiCanvasFill->y = voronoiSeeds[iSeed].y;
-					goto canvasIterationDone;
-				}
-			}
-
-			voronoiCanvasFill->x = 0.f;
-			voronoiCanvasFill->y = 0.f;
-
-		canvasIterationDone:
-			voronoiCanvasFill++;
-		}
-	}
-
-	// Allocate GPU resources, launch the computation kernel
-	unsigned char* voronoiOutputImage = (unsigned char*)malloc(diagramXDim * diagramYDim * channels * sizeof(unsigned char));
-	jumpFloodWithCuda(voronoiOutputImage, voronoiCanvas, diagramXDim, diagramYDim);
-
-	char* diagramFileName = "./data/Diagram.ppm";
-	__savePPM(diagramFileName, voronoiOutputImage, diagramXDim, diagramYDim, 3);
-	printf("Wrote '%s'\n", diagramFileName);
-
-	free(voronoiOutputImage);
-	return 0;
 }
